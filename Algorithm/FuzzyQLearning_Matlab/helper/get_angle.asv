@@ -1,0 +1,6 @@
+function angle = get_angle(d1, d2, d3, d4)
+
+% range 1: -135 -45
+% range 2: -75 15
+% range 3: -15 75
+% range 4: 45 135

@@ -1,0 +1,432 @@
+%% Before running the program
+addpath(genpath(pwd));
+close all
+clearvars
+clc
+
+% Simulation params
+tmax = 20;
+dt = 0.03;
+Nespisodes = 50;
+vmax = 750;
+kv = 2.5;
+kw = 5;
+
+% Intialize plot variables
+global t posPlot dirPlot vPlot wPlot closestPlot
+t           = zeros(5000, 1);
+posPlot     = zeros(5000, 2);
+dirPlot     = zeros(5000, 1);
+vPlot       = zeros(5000, 1);
+wPlot       = zeros(5000, 1);
+closestPlot = zeros(5000, 1);
+
+% Q-learning coefficient
+alpha0   = 0.8;         % learning rate
+gamma    = 0.7;         % discount factor
+epsilon0 = 0.1;         % epsilon-greedy coeff (exploration rate)
+decr     = 0.998;       % decrease factor
+
+%% Initialize fuzzy parameters
+NConclusions = 5;
+NRules = 25;
+q = zeros(NRules, NConclusions);
+conclusions = zeros(NRules,1);
+% Fuzzy output
+NB = -pi/2;    
+NS = -pi/4;    
+Z  =  0;       
+PS =  pi/4;    
+PB =  pi/2;    
+action = [NB; NS; Z; PS; PB];
+seleced_action = zeros(NRules, 1);
+
+
+%% Load the environment and confirm to start
+f = figure('Name', 'Motion simulation');
+f.Position = [236,378,1375,425];
+ax1 = subplot(1, 2, 1);
+ax2 = subplot(1, 2, 2);
+pos_table = get(ax2, 'Position');
+delete(ax2);
+col = {'-90', '-45', '0', '45', '90'};
+row = {'R1', 'R2', 'R3', 'R4', 'R5', ...
+       'R6', 'R7', 'R8', 'R9', 'R10', ...
+       'R11', 'R12', 'R13', 'R14', 'R15', ...
+       'R16', 'R17', 'R18', 'R19', 'R20', ...
+       'R21', 'R22', 'R23', 'R24', 'R25', ...
+    };
+Qtable = uitable(f,'Columnname', col, 'ColumnWidth', {80, 80, 80, 80, 80}, 'Rowname', row, 'Data', zeros(length(row), length(col)));
+Qtable.Data = q;
+set(Qtable, 'units', 'normalized');
+set(Qtable, 'position', pos_table);
+f.CurrentAxes = ax1;
+
+% Record the video of the training phase
+frame = 0;
+vid = VideoWriter('training.avi');
+vid.Quality = 100;
+vid.FrameRate = 20;
+open(vid);
+
+[start, goal, staticObs, movingObs, hMObs, hStart] = init_env();
+question = 'Are you ready to start?';
+dlgtitle = 'Begin';
+option1 = 'Yes';
+option2 = 'No';
+option = questdlg(question, dlgtitle, option1, option2, option1);
+
+%% Main function
+if strcmp(option, option1)
+    delete(hStart);
+    [robot, robotParams, hRobot, hStart] = init_robot(start, goal);
+    radRobot = robotParams(1);
+    initialMovingObs = movingObs;
+    addedRandom = false;
+    fprintf('Training phase\n');
+    for espisode = 1:Nespisodes
+        title(strcat(["Training phase: Espisode "], [string(espisode)]));
+        fprintf('Espisode %d:', espisode);
+        
+        % Initialise plot variables
+        count = 1;
+        trace = [];
+        posPlot(count, :) = robot(1:2);
+        dirPlot(count, :) = robot(3);
+        vPlot(count) = robot(4);
+        wPlot(count) = robot(5);
+        closestPlot(count) = 1000;
+        
+        % Initialise Q learning params
+		alphaI=alpha0;
+        epsilonI=epsilon0;
+        collided = 0;
+        
+        [dirGoal, disGoal0] = calc_vector(robot(1:2), goal);
+        while (t(count) < tmax && ~collided && disGoal0 > 20)
+            xlabel(strcat(["t = "], [string(t(count))]));
+            [dirGoal, disGoal0] = calc_vector(robot(1:2), goal);
+            heading_angle = limit_angle(dirGoal-robot(3));
+            senseObs = sense_obs(staticObs, movingObs, robot);
+            nearestObs = senseObs(1,:);
+            near2ndObs = senseObs(2,:);
+            d1 = nearestObs(3) - radRobot - nearestObs(5);
+            danger_angle = limit_angle(nearestObs(4) - robot(3));
+            d0 = d1;
+            d2 = near2ndObs(3) - radRobot - near2ndObs(5);
+            danger_angle2 = limit_angle(near2ndObs(4) - robot(3));
+            if abs(danger_angle) > pi/2 && d1 > 100 && d2 < 400 && abs(danger_angle2) < pi/2
+                danger_angle = danger_angle2;
+                d0 = d2;
+            end
+            prev_posRobot = robot(1:2);
+            if d0 > 600 || disGoal0 < 400 || robot(1) > 4000 || robot(1) < 0 ...
+                || robot(2) < 0 || robot(2) > 3000
+                vRef = kv*disGoal0;
+                wRef = 2.5*(heading_angle);
+                [robot, hRobot] = update_robot(robot, hRobot, robotParams, [vRef, wRef], dt);
+                [movingObs, hMObs] = update_mObs(movingObs, hMObs, dt);
+            else
+                alphaI=alphaI*decr; 
+                epsilonI=epsilonI*decr;
+                
+                %% 2-select an action for each rule
+                for rule=1:NRules
+%                     if rand > epsilonI                                  % exploitation
+%                         [QValue, Curr_Conclusion] = max(q(rule,:));     % the q table is in order
+%                     else                                                % exploration
+%                         Curr_Conclusion=round((NConclusions-1)*rand+1);
+%                     end
+                    [QValue, Curr_Conclusion] = max(q(rule,:));
+                    conclusions(rule)=Curr_Conclusion;                  % update the conclusion of each rule
+                end
+                
+                %% 3-calculate the control action by the fuzzy controller 
+                %obs_data = get_obs(d0);
+                rule_deg0 = get_rules(min(max(heading_angle/pi*180, -90), 90), min(max(danger_angle/pi*180, -120), 120));  % rule activation
+                w_rule0 = rule_deg0/sum(rule_deg0);  
+
+                selected_action = action(conclusions); 
+                dirRef = selected_action'*w_rule0;
+                
+                %% 4-approximate the Q function from the q-values and the levels of the rule
+
+                Q0 = 0;
+                for i=1:NRules
+                    Q0 = Q0 + w_rule0(i)*q(i,conclusions(i)); 
+                end
+
+                %% 5-take action a and let the system goes to the next state  
+                vRef = vmax;
+                wRef = kw*sin(dirRef + heading_angle);
+                [robot, hRobot] = update_robot(robot, hRobot, robotParams, [vRef, wRef], dt);
+                [movingObs, hMObs] = update_mObs(movingObs, hMObs, dt);
+                [dirGoal, disGoaln] = calc_vector(robot(1:2), goal);
+                heading_angle = limit_angle(dirGoal-robot(3));
+                senseObs = sense_obs(staticObs, movingObs,  robot);
+                nearestObs = senseObs(1,:);
+                near2ndObs = senseObs(2,:);
+                d1 = nearestObs(3) - radRobot - nearestObs(5);
+                danger_angle = limit_angle(nearestObs(4) - robot(3));
+                dn = d1;
+                d2 = near2ndObs(3) - radRobot - near2ndObs(5);
+                danger_angle2 = limit_angle(near2ndObs(4) - robot(3));
+                if abs(danger_angle) > pi/2 && d1 > 90 && d2 < 400 && abs(danger_angle2) < pi/2
+                    danger_angle = danger_angle2;
+                    dn = d2;
+                end
+                
+                %% 6- observe the reinforcement signal r(t+1) and compute the value for new state
+                [reward, collided]= get_reward(d0, dn, disGoal0, disGoaln);
+                rule_deg1 = get_rules(min(max(heading_angle/pi*180, -90), 90), min(max(danger_angle/pi*180, -120), 120));
+                w_rule1 = rule_deg1/sum(rule_deg1);
+                V = 0;
+                for i=1:NRules
+                   V = V + (w_rule1(i)*max(q(i,:)));            
+                end
+                
+                %% 7- calculate the error signal
+                delta_Q = reward + gamma*V - Q0;
+
+                %% 8- update q-values
+                for i=1:NRules
+                   q(i,conclusions(i))=q(i,conclusions(i))+ alphaI*delta_Q*w_rule0(i);
+                end
+            end
+            %% Add random obstacles and record the video
+            [~, disGoal] = calc_vector(robot(1:2), goal);
+            if (disGoal < 800) && (~addedRandom)
+                [randomObs, hRandom] = addRandomObs(robot, goal);
+                staticObs = [staticObs; randomObs];
+                addedRandom = true;
+            end
+                
+            % Update the simulation at current time and record the frame
+            drawnow
+            frame = frame+1;
+            M(frame) = getframe(f);
+            writeVideo(vid,M(frame));
+            
+            % Update trace of the robot movement
+            posRobot = robot(1:2);
+            hold on
+            h1 = plot([prev_posRobot(1), posRobot(1)], [prev_posRobot(2), posRobot(2)], ":r");
+            trace = [trace h1];
+            hold off
+            
+            % Update plotting record
+            count = count+1;
+            t(count) = t(count-1) + dt;
+            posPlot(count, :) = robot(1:2);
+            dirPlot(count, :) = robot(3);
+            vPlot(count) = robot(4);
+            wPlot(count) = robot(5);
+            closestPlot(count) = d1;
+        end
+        
+        %% Print out the results of the espisode
+        if disGoal0 < 20
+            fprintf(' Success \n');    
+        elseif t(count) >= tmax
+            fprintf(' Time out \n');
+        else
+            fprintf(' Collided \n');
+        end
+        
+        %% Clear the environment after an espisode
+        % Delete random obstacle if exists
+        if addedRandom
+            addedRandom = false;
+            staticObs = staticObs(1:(end-1),:);
+            delete(hRandom);
+        end
+        
+        % Delete the trace line that the robot moving in this espisodes
+        delete(trace);
+        Qtable.Data = q;
+        
+        % Reset the initial position of the robot and reset the movement of
+        % the moving obstacles.
+        [robot, hRobot, hStart] = reset_robot(start, hRobot, robotParams, goal, hStart);
+        [movingObs, hMObs] = reset_mObs(initialMovingObs, hMObs);
+    end
+    addedRandom = false;
+    fprintf('Testing phase\n');
+    for i=1:size(start,1)
+        title(strcat(["Testing phase: Test case "], [string(i)]));
+        [robot, hRobot, hStart] = reset_robot(start(i,:), hRobot, robotParams, goal, hStart);
+        [movingObs, hMObs] = reset_mObs(initialMovingObs, hMObs);
+        fprintf('Test case %d:', i);
+        
+        % Initialise plot variables
+        count = 1;
+        trace = [];
+        posPlot(count, :) = robot(1:2);
+        dirPlot(count, :) = robot(3);
+        vPlot(count) = robot(4);
+        wPlot(count) = robot(5);
+        closestPlot(count) = 1000;
+        
+        % Initialise Q learning params
+        collided = 0;
+        
+        [dirGoal, disGoal0] = calc_vector(robot(1:2), goal);
+        while (t(count) < tmax && ~collided && disGoal0 > 20)
+            xlabel(strcat(["t = "], [string(t(count))]));
+           [dirGoal, disGoal0] = calc_vector(robot(1:2), goal);
+            heading_angle = limit_angle(dirGoal-robot(3));
+            senseObs = sense_obs(staticObs, movingObs, robot);
+            nearestObs = senseObs(1,:);
+            d0 = nearestObs(3) - radRobot - nearestObs(5);
+            danger_angle = nearestObs(4) - robot(3);
+            prev_posRobot = robot(1:2);
+            if d0 > 600 || disGoal0 < 400
+                vRef = kv*disGoal0;
+                wRef = 2.5*(heading_angle);
+                [robot, hRobot] = update_robot(robot, hRobot, robotParams, [vRef, wRef], dt);
+                [movingObs, hMObs] = update_mObs(movingObs, hMObs, dt);
+            else
+                
+                %% 2-select an action for each rule
+                for rule=1:NRules
+                    [~, Curr_Conclusion] = max(q(rule,:));     % the q table is in order
+                    conclusions(rule)=Curr_Conclusion;              % update the conclusion of each rule
+                end
+                
+                %% 3-calculate the control action by the fuzzy controller 
+                %obs_data = get_obs(d0);
+                rule_deg = get_rules(min(max(heading_angle/pi*180, -90), 90), min(max(danger_angle/pi*180, -120), 120));  % rule activation
+                w_rule = rule_deg/sum(rule_deg);  
+                selected_action = action(conclusions); 
+                dirRef = selected_action'*w_rule;
+
+                %% 5-take action a and let the system goes to the next state  
+                vRef = vmax;
+                wRef = kw*sin(dirRef + heading_angle);
+                [robot, hRobot] = update_robot(robot, hRobot, robotParams, [vRef, wRef], dt);
+                [movingObs, hMObs] = update_mObs(movingObs, hMObs, dt);
+                [dirGoal, disGoaln] = calc_vector(robot(1:2), goal);
+                heading_angle = limit_angle(dirGoal-robot(3));
+                senseObs = sense_obs(staticObs, movingObs,  robot);
+                nearestObs = senseObs(1,:);
+                dn = nearestObs(3) - radRobot - nearestObs(5);
+                danger_angle = nearestObs(4) - robot(3);
+                
+                %% 6- observe the reinforcement signal r(t+1) and compute the value for new state
+                [~, collided]= get_reward(d0, dn, disGoal0, disGoaln);
+            end
+            %% Add random obstacles and record the video
+            [~, disGoal] = calc_vector(robot(1:2), goal);
+            if (disGoal < 800) && (~addedRandom)
+                [randomObs, hRandom] = addRandomObs(robot, goal);
+                staticObs = [staticObs; randomObs];
+                addedRandom = true;
+            end
+                
+            % Update the simulation at current time and record the frame
+            drawnow
+            frame = frame+1;
+            M(frame) = getframe(f);
+            writeVideo(vid,M(frame));
+            
+            % Update trace of the robot movement
+            posRobot = robot(1:2);
+            hold on
+            h1 = plot([prev_posRobot(1), posRobot(1)], [prev_posRobot(2), posRobot(2)], ":r");
+            trace = [trace h1];
+            hold off
+            
+            % Update plotting record
+            count = count+1;
+            t(count) = t(count-1) + dt;
+            posPlot(count, :) = robot(1:2);
+            dirPlot(count, :) = robot(3);
+            vPlot(count) = robot(4);
+            wPlot(count) = robot(5);
+            closestPlot(count) = dn;
+        end
+        
+        %% Print out the results of the espisode
+        if disGoal0 < 20
+            fprintf(' Success \n');    
+        elseif t(count) >= tmax
+            fprintf(' Time out \n');
+        else
+            fprintf(' Collided \n');
+        end
+        
+        %% Clear the environment after an espisode
+        % Delete random obstacle if exists
+        if addedRandom
+            addedRandom = false;
+            staticObs = staticObs(1:(end-1),:);
+            delete(hRandom);
+        end
+        
+        % Delete the trace line that the robot moving in this espisodes
+        delete(trace);
+    end
+    plot_results(count);
+end
+
+%% After running the program 
+close(vid);
+rmpath(genpath(pwd));
+
+%% Helper function
+%-------------------------------------------------------------------------%
+function [randomObs, hRandom] = addRandomObs(robot, goal)
+    radObs = 80;
+    distance = 300;
+    dirGoal = calc_vector(robot(1:2), goal);
+    posObs = goal + distance*[cos(dirGoal-pi) sin(dirGoal-pi)];
+    hold on
+    hRandom = viscircles(posObs, radObs, 'LineWidth', 1, 'Color', 'black');
+    hold off
+    randomObs = [posObs radObs];
+end
+
+function plot_results(count)
+    global t posPlot dirPlot vPlot wPlot closestPlot
+    % Plot the info about the robot
+    figure('Name','Robot parameters');
+    % Create a position graph
+    subplot(3,2,1)
+    plot(t(1:count), posPlot(1:count,:), 'LineWidth', 2);
+    title('Robot Position');
+    ylabel('Position(mm)');
+    xlabel('time(s)');
+    hold on;
+
+    % Create a direction graph
+    subplot(3,2,2)
+    plot(t(1:count), dirPlot(1:count), 'LineWidth', 2);
+    title('Robot Direction');
+    ylabel('Direction(rad)');
+    xlabel('time(s)');
+    hold on;
+
+    % Create a position graph
+    subplot(3,2,3)
+    plot(t(1:count), vPlot(1:count), 'LineWidth', 2);
+    title('Robot Velocity');
+    ylabel('v(mm/s^2)');
+    xlabel('time(s)');
+    hold on;
+
+    % Create a direction graph
+    subplot(3,2,4)
+    plot(t(1:count), wPlot(1:count), 'LineWidth', 2);
+    title('Robot Angular Velocity');
+    ylabel('\omega(rad/s)');
+    xlabel('time(s)');
+    hold off;
+
+    % Create closest distance graph
+    subplot(3,2,5:6)
+    plot(t(1:count), closestPlot(1:count), 'LineWidth', 2);
+    title('Obstacle Closest Distance');
+    ylabel('distance (mm)');
+    xlabel('time(s)');
+end
+%-------------------------------------------------------------------------%
